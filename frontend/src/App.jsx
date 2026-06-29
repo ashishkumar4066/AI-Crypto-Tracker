@@ -2,7 +2,6 @@ import { useState, useCallback } from 'react'
 import Sidebar from './components/Sidebar'
 import FlowGraph from './pages/FlowGraph'
 import Transactions from './pages/Transactions'
-import Tally from './pages/Tally'
 
 function App() {
   const [currentView, setCurrentView] = useState('transactions')
@@ -30,9 +29,6 @@ function App() {
         )}
         {currentView === 'transactions' && (
           <Transactions exchange={selectedExchange} exchangeLabel={exchangeLabel} />
-        )}
-        {currentView === 'tally' && (
-          <Tally exchange={selectedExchange} exchangeLabel={exchangeLabel} />
         )}
       </main>
     </div>

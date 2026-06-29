@@ -5,7 +5,6 @@ import {
   TrendingUp,
   ChevronRight,
   Layers,
-  Scale,
 } from 'lucide-react'
 
 const exchanges = [
@@ -66,7 +65,6 @@ function ExchangeItem({ ex, isOpen, isActive, onToggle, currentView, onNavigate 
           {[
             { id: 'transactions', label: 'Transactions', icon: TableProperties },
             { id: 'flow', label: 'Flow Map', icon: GitBranch },
-            { id: 'tally', label: 'Tally', icon: Scale },
           ].map((item) => {
             const Icon = item.icon
             const active = isActive && currentView === item.id

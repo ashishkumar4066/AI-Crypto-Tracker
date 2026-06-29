@@ -8,7 +8,6 @@ const api = axios.create({
   },
 })
 
-// Response interceptor for error handling
 api.interceptors.response.use(
   (response) => response.data,
   (error) => {
@@ -17,14 +16,11 @@ api.interceptors.response.use(
   }
 )
 
-export const syncData = (fy) => api.post('/sync', { fy })
-
-export const getTransactions = ({ fy, asset, type, source, page = 1, limit = 50 }) => {
+export const getTransactions = ({ fy, asset, type, page = 1, limit = 50 }) => {
   const params = new URLSearchParams()
   if (fy) params.append('fy', fy)
   if (asset) params.append('asset', asset)
   if (type) params.append('type', type)
-  if (source) params.append('source', source)
   params.append('page', page)
   params.append('limit', limit)
   return api.get(`/transactions?${params.toString()}`)
@@ -47,19 +43,6 @@ export const getAssetGraph = (asset, fy) => {
 }
 
 export const getFinancialYears = () => api.get('/financial-years')
-
-export const getSyncStatus = (fy) => {
-  const params = fy ? `?fy=${fy}` : ''
-  return api.get(`/sync/status${params}`)
-}
-
-export const getTally = ({ fy, asset } = {}) => {
-  const params = new URLSearchParams()
-  if (fy) params.append('fy', fy)
-  if (asset) params.append('asset', asset)
-  const query = params.toString()
-  return api.get(`/import/tally${query ? '?' + query : ''}`)
-}
 
 export const importExcel = (files) => {
   const formData = new FormData()

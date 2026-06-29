@@ -71,7 +71,7 @@ Instead of hitting each explorer individually, use **Moralis** or **Covalent** A
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │                    API Router Layer                       │  │
-│  │  /api/v1/sync      — trigger data sync from exchanges    │  │
+│  │  /api/v1/import    — bulk Excel upload from exchanges    │  │
 │  │  /api/v1/txns      — query unified ledger (filter/sort)  │  │
 │  │  /api/v1/holdings  — current portfolio snapshot          │  │
 │  │  /api/v1/matches   — transfer matching results + review  │  │
@@ -80,8 +80,8 @@ Instead of hitting each explorer individually, use **Moralis** or **Covalent** A
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  ┌────────────┐  ┌────────────┐  ┌──────────┐  ┌───────────┐  │
-│  │  Exchange   │  │  Transfer  │  │   FIFO   │  │  Graph    │  │
-│  │  Sync      │  │  Matching  │  │   Cost   │  │  Builder  │  │
+│  │  Excel     │  │  Transfer  │  │   FIFO   │  │  Graph    │  │
+│  │  Import    │  │  Matching  │  │   Cost   │  │  Builder  │  │
 │  │  Engine    │  │  Engine    │  │   Basis  │  │           │  │
 │  └──────┬─────┘  └──────┬─────┘  └────┬─────┘  └─────┬─────┘  │
 │         │               │              │              │         │
@@ -91,7 +91,7 @@ Instead of hitting each explorer individually, use **Moralis** or **Covalent** A
 └─────────────────────────────┬───────────────────────────────────┘
                               │
 ┌─────────────────────────────┴───────────────────────────────────┐
-│                   PostgreSQL (Supabase / Local)                  │
+│                      SQLite (Local Dev)                          │
 │                                                                  │
 │  ┌──────────────┐  ┌───────────┐  ┌──────────┐  ┌───────────┐  │
 │  │ transactions  │  │  matches  │  │  lots    │  │  wallets  │  │
@@ -107,9 +107,10 @@ Instead of hitting each explorer individually, use **Moralis** or **Covalent** A
 
 ```
 Step 1: INGEST
-  ├── Exchange APIs → raw JSON per endpoint
-  ├── Chain explorers → raw transaction list per address
-  └── Store raw_json in transactions table (audit trail)
+  ├── Excel uploads from exchange Data Download Centers (.xlsx)
+  ├── Auto-detect exchange and file type from Row 3
+  ├── Parse with exchange-specific parsers (exchanges/binance/parsers.py)
+  └── Deduplicate on (exchange, source_endpoint, external_id)
 
 Step 2: NORMALIZE
   ├── Each connector transforms its response → unified ledger schema

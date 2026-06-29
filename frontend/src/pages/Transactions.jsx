@@ -6,6 +6,8 @@ import YearFilter, { allYears } from '../components/YearFilter'
 import { getTransactions } from '../api/client'
 
 const ITEMS_PER_PAGE = 10
+const SORT_KEY_MAP = { 'Date': 'date', 'Type': 'type', 'Asset': 'asset', 'Amount': 'amount', 'Price (USD)': 'price', 'Value (INR)': 'value', 'Fee': 'fee', 'Source': 'source', 'Dest Wallet': 'destWallet', 'TxHash': 'txHash' }
+const NUMERIC_KEYS = new Set(['amount', 'price', 'value', 'fee'])
 
 const transactionTypes = [
   'BUY', 'P2P_BUY', 'SELL', 'P2P_SELL',
@@ -28,14 +30,10 @@ export default function Transactions({ exchange, exchangeLabel }) {
   const [searchQuery, setSearchQuery] = useState('')
   const [page, setPage] = useState(1)
   const [refreshTrigger, setRefreshTrigger] = useState(0)
-  const [dataSource, setDataSource] = useState('excel')
+  const [sortColumn, setSortColumn] = useState(null)
+  const [sortDirection, setSortDirection] = useState(null)
 
   const handleImportComplete = useCallback(() => {
-    setRefreshTrigger((prev) => prev + 1)
-  }, [])
-
-  const handleSourceChange = useCallback((src) => {
-    setDataSource(src)
     setRefreshTrigger((prev) => prev + 1)
   }, [])
 
@@ -45,7 +43,7 @@ export default function Transactions({ exchange, exchangeLabel }) {
     async function fetchData() {
       try {
         const results = await Promise.all(
-          selectedYears.map((fy) => getTransactions({ fy, source: dataSource, limit: 5000 }).catch(() => null))
+          selectedYears.map((fy) => getTransactions({ fy, limit: 5000 }).catch(() => null))
         )
         if (cancelled) return
         const allTxns = results
@@ -57,6 +55,7 @@ export default function Transactions({ exchange, exchangeLabel }) {
             fee: tx.fee || 0, feeAsset: tx.fee_asset || '',
             counterAsset: tx.counter_asset || '',
             source: tx.source_wallet || tx.exchange || '',
+            destWallet: tx.dest_wallet || '',
             txHash: tx.txhash || '',
           }))
         setTransactions(allTxns)
@@ -64,7 +63,7 @@ export default function Transactions({ exchange, exchangeLabel }) {
     }
     fetchData()
     return () => { cancelled = true }
-  }, [selectedYears, exchange, refreshTrigger, dataSource])
+  }, [selectedYears, exchange, refreshTrigger])
 
   const uniqueAssets = useMemo(() => [...new Set(transactions.map((tx) => tx.asset))].sort(), [transactions])
 
@@ -75,7 +74,8 @@ export default function Transactions({ exchange, exchangeLabel }) {
       if (searchQuery) {
         const q = searchQuery.toLowerCase()
         return tx.asset.toLowerCase().includes(q) || tx.type.toLowerCase().includes(q) ||
-          tx.source.toLowerCase().includes(q) || (tx.txHash && tx.txHash.toLowerCase().includes(q))
+          tx.source.toLowerCase().includes(q) || tx.destWallet.toLowerCase().includes(q) ||
+          (tx.txHash && tx.txHash.toLowerCase().includes(q))
       }
       return true
     })
@@ -118,8 +118,32 @@ export default function Transactions({ exchange, exchangeLabel }) {
     return { buys, sells, converts, p2pInvested: p2pLabel, totalFees: feeList }
   }, [filtered])
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / ITEMS_PER_PAGE))
-  const paginatedTxns = filtered.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE)
+  const handleSort = useCallback((column) => {
+    if (sortColumn === column) {
+      if (sortDirection === 'asc') setSortDirection('desc')
+      else if (sortDirection === 'desc') { setSortColumn(null); setSortDirection(null) }
+    } else {
+      setSortColumn(column)
+      setSortDirection('asc')
+    }
+    setPage(1)
+  }, [sortColumn, sortDirection])
+
+  const sorted = useMemo(() => {
+    if (!sortColumn || !sortDirection) return filtered
+    const key = SORT_KEY_MAP[sortColumn]
+    if (!key) return filtered
+    const isNum = NUMERIC_KEYS.has(key)
+    const dir = sortDirection === 'asc' ? 1 : -1
+    return [...filtered].sort((a, b) => {
+      const va = a[key], vb = b[key]
+      if (isNum) return (parseFloat(va || 0) - parseFloat(vb || 0)) * dir
+      return String(va || '').localeCompare(String(vb || '')) * dir
+    })
+  }, [filtered, sortColumn, sortDirection])
+
+  const totalPages = Math.max(1, Math.ceil(sorted.length / ITEMS_PER_PAGE))
+  const paginatedTxns = sorted.slice((page - 1) * ITEMS_PER_PAGE, page * ITEMS_PER_PAGE)
 
   useEffect(() => { setPage(1) }, [filterAsset, filterType, searchQuery])
 
@@ -157,13 +181,7 @@ export default function Transactions({ exchange, exchangeLabel }) {
         padding: '20px 40px 0',
         background: 'linear-gradient(to bottom, #f8fafc 92%, transparent)',
       }}>
-        <ImportSection
-          onImportComplete={handleImportComplete}
-          selectedFY={selectedYears[0]}
-          exchange={exchange}
-          onSourceChange={handleSourceChange}
-          onYearChange={(fy) => setSelectedYears([fy])}
-        />
+        <ImportSection onImportComplete={handleImportComplete} />
       </div>
 
       {/* Stats (only when data exists) */}
@@ -290,6 +308,9 @@ export default function Transactions({ exchange, exchangeLabel }) {
           page={page}
           totalPages={totalPages}
           onPageChange={setPage}
+          sortColumn={sortColumn}
+          sortDirection={sortDirection}
+          onSort={handleSort}
         />
       </div>
     </div>

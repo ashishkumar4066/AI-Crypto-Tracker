@@ -1,4 +1,4 @@
-import { ExternalLink, Inbox, ChevronLeft, ChevronRight } from 'lucide-react'
+import { ExternalLink, Inbox, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 
 const typeBadge = {
   BUY:               { bg: '#ecfdf5', color: '#047857', border: '#a7f3d0' },
@@ -28,12 +28,18 @@ function fmtTime(d) { return new Date(d).toLocaleTimeString('en-IN', { hour: '2-
 function fmtNum(n) { const v = parseFloat(n); return isNaN(v) ? n : v.toLocaleString('en-IN', { maximumFractionDigits: 8 }) }
 function truncHash(h) { return h ? `${h.slice(0, 6)}...${h.slice(-4)}` : null }
 
-const headers = ['Date', 'Type', 'Asset', 'Amount', 'Price (USD)', 'Value (INR)', 'Fee', 'Source', 'TxHash']
+const headers = ['Date', 'Type', 'Asset', 'Amount', 'Price (USD)', 'Value (INR)', 'Fee', 'Source', 'Dest Wallet', 'TxHash']
 
 const cellBase = { padding: '16px 20px', verticalAlign: 'middle' }
 const monoStyle = { fontFamily: "'JetBrains Mono', monospace", fontVariantNumeric: 'tabular-nums' }
 
-export default function TransactionTable({ transactions, page, totalPages, onPageChange }) {
+function SortIcon({ column, sortColumn, sortDirection }) {
+  if (sortColumn !== column) return <ChevronsUpDown size={12} style={{ opacity: 0.3, marginLeft: 4 }} />
+  if (sortDirection === 'asc') return <ChevronUp size={12} style={{ color: '#6366f1', marginLeft: 4 }} />
+  return <ChevronDown size={12} style={{ color: '#6366f1', marginLeft: 4 }} />
+}
+
+export default function TransactionTable({ transactions, page, totalPages, onPageChange, sortColumn, sortDirection, onSort }) {
   if (!transactions || transactions.length === 0) {
     return (
       <div style={{
@@ -61,16 +67,22 @@ export default function TransactionTable({ transactions, page, totalPages, onPag
           <thead>
             <tr style={{ background: '#f8fafc' }}>
               {headers.map((h, i) => (
-                <th key={h} style={{
+                <th key={h} onClick={() => onSort && onSort(h)} style={{
                   textAlign: 'left', fontSize: 11, fontWeight: 700,
                   textTransform: 'uppercase', letterSpacing: '0.06em',
-                  color: '#94a3b8', padding: '14px 20px',
+                  color: sortColumn === h ? '#6366f1' : '#94a3b8',
+                  padding: '14px 20px',
                   paddingLeft: i === 0 ? 28 : 20,
                   paddingRight: i === headers.length - 1 ? 28 : 20,
                   borderBottom: '1px solid #f1f5f9',
                   whiteSpace: 'nowrap',
+                  cursor: 'pointer', userSelect: 'none',
+                  transition: 'color 0.15s',
                 }}>
-                  {h}
+                  <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+                    {h}
+                    <SortIcon column={h} sortColumn={sortColumn} sortDirection={sortDirection} />
+                  </span>
                 </th>
               ))}
             </tr>
@@ -148,6 +160,11 @@ export default function TransactionTable({ transactions, page, totalPages, onPag
                   {/* Source */}
                   <td style={cellBase}>
                     <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}>{tx.source}</span>
+                  </td>
+
+                  {/* Dest Wallet */}
+                  <td style={cellBase}>
+                    <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}>{tx.destWallet || '—'}</span>
                   </td>
 
                   {/* TxHash */}

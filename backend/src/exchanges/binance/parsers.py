@@ -294,39 +294,43 @@ def _parse_spot_orders(headers: list[str], rows: list[list]) -> list[dict]:
 def _parse_convert(headers: list[str], rows: list[list]) -> list[dict]:
     """
     Convert Order History.
-    Headers: Time | OrderNo | Pair | Side | Price | Executed | Amount | Fee | Status
-    (structure similar to spot trades)
+    Actual format: Time | Wallet | Pair | Type | Sell | Buy | Price | Inverse Price | Date Updated | Status
+    Sell/Buy have embedded units: '203.85385652 POL', '19.82587663 USDT'
     """
     col = _col_map(headers)
     txns = []
     for row in rows:
         status = str(_cell(row, col, "Status")).strip()
-        if status not in ("Filled", "Completed", "SUCCESS", "Success"):
+        if status not in ("Successful", "Filled", "Completed", "SUCCESS", "Success"):
             continue
 
-        exec_amt, exec_unit = _split_amount_unit(_cell(row, col, "Executed"))
-        total_amt, total_unit = _split_amount_unit(_cell(row, col, "Amount"))
-        order_no = str(_cell(row, col, "OrderNo", _cell(row, col, "Order No"))).strip()
+        sell_val = str(_cell(row, col, "Sell")).strip()
+        buy_val = str(_cell(row, col, "Buy")).strip()
 
-        if exec_amt == 0:
+        sell_amt, sell_asset = _split_amount_unit(sell_val)
+        buy_amt, buy_asset = _split_amount_unit(buy_val)
+
+        if sell_amt == 0 and buy_amt == 0:
             continue
+
+        time_str = str(_cell(row, col, "Time")).strip()
 
         txns.append({
             "id": _uuid(),
-            "datetime": _parse_dt(_cell(row, col, "Time")),
+            "datetime": _parse_dt(time_str),
             "type": "CONVERT",
-            "asset": exec_unit,
-            "amount": exec_amt,
+            "asset": buy_asset,
+            "amount": buy_amt,
             "fee": 0.0,
             "fee_asset": "",
-            "price": _float(_cell(row, col, "Price")),
-            "quote_amount": total_amt,
-            "counter_asset": total_unit,
+            "price": sell_amt / buy_amt if buy_amt > 0 else 0.0,
+            "quote_amount": sell_amt,
+            "counter_asset": sell_asset,
             "source_wallet": "binance_convert",
             "dest_wallet": "binance_spot",
             "source_endpoint": "excel_convert",
             "exchange": "binance",
-            "external_id": order_no or f"convert_{_cell(row, col, 'Time')}_{exec_amt}",
+            "external_id": f"convert_{time_str}_{sell_asset}_{buy_asset}_{sell_amt}",
             "status": status,
             "created_at": _now_iso(),
             "updated_at": _now_iso(),

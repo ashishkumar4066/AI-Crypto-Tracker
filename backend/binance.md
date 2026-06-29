@@ -2,69 +2,38 @@
 
 ## Project Context
 
-Production-grade crypto portfolio tracker replacing Koinly. This module handles complete data extraction from Binance via two channels:
+Production-grade crypto portfolio tracker replacing Koinly. This module handles complete data ingestion from Binance via **Excel imports** from the Binance Data Download Center.
 
-1. **API Sync** — Real-time data from Binance REST API (spot trades, dust, convert, fiat orders)
-2. **Excel Import** — Historical data from Binance Data Download Center (C2C, deposits, withdrawals, transaction history, spot trades/orders)
-
-**Why two channels:** Binance API has retention limits that delete old data:
+**Why Excel-only (no API sync):** Binance API has retention limits that delete old data:
 - Deposits/Withdrawals: 90-day retention
 - C2C/P2P: 6-month retention
-- Spot trades via `myTrades`: No retention limit (full history available)
+- Spot trades via `myTrades`: No retention limit, but incomplete without deposit/withdrawal context
 
-Koinly has the same limitation — it calls these same APIs and silently misses historical P2P trades, causing portfolio valuation errors (₹1L shown vs ₹2L actual).
+Koinly has the same limitation — it calls these APIs and silently misses historical P2P trades, causing portfolio valuation errors (₹1L shown vs ₹2L actual). The Binance Data Download Center provides **complete history with no retention limits**.
 
 ---
 
 ## Tech Stack
 
 - **Language:** Python 3.11+
-- **HTTP:** `requests` (raw, no SDK — full control over signing and pagination)
 - **Storage:** SQLite via SQLAlchemy ORM (`backend/data/crypto_tracker.db`)
 - **API Framework:** FastAPI with async file upload support
 - **Excel Parsing:** `openpyxl` for .xlsx files
-- **Auth:** HMAC-SHA256 signed requests (API Key + Secret via env vars)
-- **Rate Limiting:** 150ms minimum gap between API calls + exponential backoff on 429
 
 ---
 
-## API Key Setup
+## Data Source
 
-1. Binance → Account → API Management → **Create Tax Report API** (read-only)
-2. Store as environment variables in `backend/.env`:
-   ```
-   BINANCE_API_KEY=your_key_here
-   BINANCE_API_SECRET=your_secret_here
-   ```
+All Binance data is imported via **Excel exports** from the Binance Data Download Center (binance.com → Orders → Data Download Center).
 
----
+**Why not API?** Binance REST API has retention limits:
+- Deposits/Withdrawals: **90-day retention** — *"Default startTime: 90 days from current timestamp"*
+- C2C/P2P: **6-month retention** — *"You can only view data from the past 6 months"*
+- Spot trades: No retention limit, but incomplete without deposit/withdrawal context
 
-## Data Sources & API Retention Limits
+**Source:** https://developers.binance.com/docs/c2c/rest-api, https://developers.binance.com/docs/wallet/capital/deposite-history
 
-### Channel 1: API Sync (via `sync_all()`)
-
-These endpoints are called during API sync. They have no meaningful retention limits or the limits don't matter for our use case.
-
-| # | Endpoint | What | Retention | Chunking | Status |
-|---|----------|------|-----------|----------|--------|
-| 1 | `GET /sapi/v1/fiat/orders` | Fiat bank buy/sell | Not documented | Page-based | ✅ Active |
-| 2 | `GET /sapi/v1/asset/dribblet` | Dust → BNB conversions | Not documented | 90-day chunks | ✅ Active |
-| 3 | `GET /sapi/v1/convert/tradeFlow` | Convert trades | "Max interval 30 days" | 30-day chunks | ✅ Active |
-| 4 | `GET /api/v3/myTrades` | Spot trade fills | **No limit** | fromId pagination | ✅ Active |
-| 5 | `GET /api/v3/account` | Current balances | N/A (live) | Single call | ✅ Symbol discovery only |
-| 6 | `GET /api/v3/exchangeInfo` | Valid trading pairs | N/A (live) | Single call | ✅ Symbol validation |
-
-### Channel 2: Excel Import (removed from API sync)
-
-These endpoints have confirmed retention limits. Data is imported from Binance Data Download Center Excel exports instead.
-
-| # | Endpoint | Retention Limit (from Binance docs) | Import Source |
-|---|----------|-------------------------------------|---------------|
-| 1 | `GET /sapi/v1/capital/deposit/hisrec` | **"Default startTime: 90 days from current timestamp"** | Excel: Deposit History |
-| 2 | `GET /sapi/v1/capital/withdraw/history` | **"Default startTime: 90 days from current timestamp"** | Excel: Withdraw History |
-| 3 | `GET /sapi/v1/c2c/orderMatch/listUserOrderHistory` | **"You can only view data from the past 6 months"** | Excel: C2C Order History |
-
-**Source:** https://developers.binance.com/docs/c2c/rest-api, https://developers.binance.com/docs/wallet/capital/deposite-history, https://developers.binance.com/docs/wallet/capital/withdraw-history
+The Data Download Center provides **complete history with no retention limits** — all the way back to account creation.
 
 ---
 
@@ -217,7 +186,7 @@ Step 7: Query myTrades for each valid pair (fromId pagination)
 
 ## Unified Transaction Schema
 
-Every record from every source (API or Excel) is normalized into this schema:
+Every record is normalized into this schema:
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -252,16 +221,10 @@ Every record from every source (API or Excel) is normalized into this schema:
 
 All under `/api/v1` prefix.
 
-### Sync
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/sync` | Trigger API extraction for a FY. Body: `{"fy": "2024-25"}` |
-| GET | `/sync/status` | Check per-phase sync results. Query: `?fy=2024-25` |
-
 ### Transactions
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/transactions` | Paginated query. Filters: `?fy=&asset=&type=&source=excel|api&page=&limit=` |
+| GET | `/transactions` | Paginated query. Filters: `?fy=&asset=&type=&page=&limit=` |
 | GET | `/holdings` | Current asset balance snapshot (credits - debits) |
 | GET | `/financial-years` | List FY periods with transaction counts |
 
@@ -275,7 +238,6 @@ All under `/api/v1` prefix.
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/import/excel` | Bulk upload .xlsx files (multipart). Auto-detects type. |
-| GET | `/import/tally` | API vs Excel comparison. Filters: `?fy=&asset=` |
 
 ### Health
 | Method | Path | Purpose |
@@ -294,7 +256,7 @@ Importing multiple Excel export types creates duplicate records for the same tra
 | 1 P2P buy | Transaction History ("P2P Trading"), C2C Order History |
 | 1 deposit | Transaction History ("Deposit"), Deposit History |
 
-These are stored as separate records (different `source_endpoint` values) intentionally — the Tally page lets users compare counts across sources to verify completeness.
+These are stored as separate records (different `source_endpoint` values) by design — deduplication prevents the same record from the same source being imported twice, but allows the same event to exist from multiple sources.
 
 **Recommendation:** For tax calculations, use Transaction History as the single source of truth — it contains all operations. Use individual exports (Spot Trade, C2C, etc.) for verification only.
 
@@ -303,21 +265,14 @@ These are stored as separate records (different `source_endpoint` values) intent
 ## Implementation Status
 
 ### ✅ Completed
-- [x] HMAC-SHA256 signing with timestamp
-- [x] Spot trades with fromId pagination (no retention limit)
-- [x] Fiat order history (page-based)
-- [x] Dust conversion log (90-day chunks)
-- [x] Convert trade flow (30-day chunks)
-- [x] Symbol discovery (balances + convert + dust + MANUAL_COINS)
 - [x] Excel import for all 7 Binance Data Download Center export types
 - [x] Bulk file upload (multiple files in one request)
 - [x] Auto-detection of Excel export type from Row 3
 - [x] Embedded unit parsing for Spot Trade values (e.g., "82.9USUAL")
 - [x] Deduplication on (exchange, source_endpoint, external_id)
-- [x] API vs Excel data separation via `source_endpoint` prefix
-- [x] Tally endpoint for comparison
+- [x] Modular architecture (`exchanges/binance/` self-contained module)
 - [x] React Flow graph visualization (5-column layout)
-- [x] Transaction explorer with filters (year, asset, type, source)
+- [x] Transaction explorer with filters (year, asset, type)
 - [x] Stat cards: Total Buys, Total Sells, P2P Invested (INR), Conversions, Total Fees (per-asset breakdown)
 
 ### 🔲 Not Yet Implemented

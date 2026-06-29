@@ -77,7 +77,6 @@ def list_transactions(
     fy: Optional[str] = Query(None, description="Financial year, e.g. 2020-21"),
     asset: Optional[str] = Query(None),
     type: Optional[str] = Query(None, description="BUY, SELL, DEPOSIT, ..."),
-    source: Optional[str] = Query(None, description="excel or api"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=10000),
     db: Session = Depends(get_db),
@@ -90,11 +89,6 @@ def list_transactions(
             Transaction.datetime >= start_dt.isoformat(),
             Transaction.datetime <= end_dt.isoformat(),
         )
-
-    if source == "excel":
-        q = q.filter(Transaction.source_endpoint.like("excel_%"))
-    elif source == "api":
-        q = q.filter(~Transaction.source_endpoint.like("excel_%"))
 
     if asset:
         q = q.filter(Transaction.asset == asset.upper())
