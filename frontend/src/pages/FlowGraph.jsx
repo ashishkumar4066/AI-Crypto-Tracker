@@ -10,7 +10,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css'
 import WalletNode from '../components/WalletNode'
 import ActionNode from '../components/ActionNode'
-import YearFilter from '../components/YearFilter'
+import YearFilter, { allYears } from '../components/YearFilter'
 import { getGraphOverview } from '../api/client'
 import { Network, Loader2, Inbox } from 'lucide-react'
 
@@ -33,7 +33,7 @@ const minimapStyle = { height: 100, width: 160 }
 const proOptions = { hideAttribution: true }
 
 export default function FlowGraph({ exchange, exchangeLabel }) {
-  const [selectedYears, setSelectedYears] = useState(['2024-25'])
+  const [selectedYears, setSelectedYears] = useState(() => allYears)
   const [nodes, setNodes, onNodesChange] = useNodesState([])
   const [edges, setEdges, onEdgesChange] = useEdgesState([])
   const [loading, setLoading] = useState(false)

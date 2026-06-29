@@ -13,10 +13,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from src.config import BINANCE_API_KEY, BINANCE_API_SECRET, FY_DATE_RANGES
+from src.config import FY_DATE_RANGES
 from src.db.database import get_db, SessionLocal
 from src.db.models import Transaction
-from src.exchanges.binance_connector import BinanceConnector
+from src.exchanges import get_connector
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -104,7 +104,7 @@ def _run_sync(fy: str, start_dt: datetime, end_dt: datetime) -> None:
     _sync_status[fy] = status
 
     db = SessionLocal()
-    connector = BinanceConnector(BINANCE_API_KEY, BINANCE_API_SECRET)
+    connector = get_connector("binance")
     total_inserted = 0
 
     # C2C, deposits, and withdrawals are imported via Excel (Binance Data

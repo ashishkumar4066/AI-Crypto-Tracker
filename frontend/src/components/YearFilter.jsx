@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Calendar, ChevronDown, Check } from 'lucide-react'
 import { mockFinancialYears } from '../data/mockData'
 
-const allYears = mockFinancialYears.map((f) => f.fy)
+export const allYears = mockFinancialYears.map((f) => f.fy)
 
 export default function YearFilter({ selectedYears, onChange }) {
   const [open, setOpen] = useState(false)

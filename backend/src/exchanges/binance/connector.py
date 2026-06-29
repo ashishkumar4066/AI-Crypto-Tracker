@@ -3,13 +3,13 @@ Full Binance REST-API connector.
 
 Covers all 8 endpoint categories:
   1. Account balances       (/api/v3/account)
-  2. Spot trades            (/api/v3/myTrades)           — fromId pagination
-  3. Deposits               (/sapi/v1/capital/deposit/hisrec)  — 90-day + offset
-  4. Withdrawals            (/sapi/v1/capital/withdraw/history) — 90-day + offset
-  5. P2P / C2C trades       (/sapi/v1/c2c/orderMatch/listUserOrderHistory) — page
-  6. Fiat orders            (/sapi/v1/fiat/orders)       — page
-  7. Dust conversions       (/sapi/v1/asset/dribblet)    — 90-day chunks
-  8. Convert trade flow     (/sapi/v1/convert/tradeFlow) — 30-day chunks
+  2. Spot trades            (/api/v3/myTrades)           -- fromId pagination
+  3. Deposits               (/sapi/v1/capital/deposit/hisrec)  -- 90-day + offset
+  4. Withdrawals            (/sapi/v1/capital/withdraw/history) -- 90-day + offset
+  5. P2P / C2C trades       (/sapi/v1/c2c/orderMatch/listUserOrderHistory) -- page
+  6. Fiat orders            (/sapi/v1/fiat/orders)       -- page
+  7. Dust conversions       (/sapi/v1/asset/dribblet)    -- 90-day chunks
+  8. Convert trade flow     (/sapi/v1/convert/tradeFlow) -- 30-day chunks
 
 Plus the symbol-discovery pipeline and data normalisation into the unified
 transaction schema.
@@ -26,15 +26,18 @@ from typing import Any, Dict, List, Optional, Set
 
 import requests
 
-from src.config import (
+from src.exchanges.binance.config import (
     BINANCE_API_KEY,
     BINANCE_API_SECRET,
     BINANCE_BASE_URL,
     MANUAL_COINS,
     QUOTE_ASSETS,
+)
+from src.config import (
     RECV_WINDOW,
     REQUEST_DELAY_MS,
 )
+from src.exchanges.base import BaseExchangeConnector
 from src.utils.hmac_signer import sign_params
 
 logger = logging.getLogger(__name__)
@@ -67,7 +70,7 @@ def _uuid() -> str:
 # Connector
 # ---------------------------------------------------------------------------
 
-class BinanceConnector:
+class BinanceConnector(BaseExchangeConnector):
     """
     Production Binance data extractor.
 
@@ -91,6 +94,12 @@ class BinanceConnector:
         self._session = requests.Session()
         self._session.headers.update({"X-MBX-APIKEY": self.api_key})
         self._last_request_ts: float = 0.0
+
+    # ----- abstract property from BaseExchangeConnector --------------------
+
+    @property
+    def exchange_name(self) -> str:
+        return "binance"
 
     # ----- low-level request ----------------------------------------------
 
@@ -714,7 +723,7 @@ class BinanceConnector:
         except Exception as exc:
             logger.warning("Could not fetch balances for symbol discovery: %s", exc)
 
-        # Steps 2-3: deposits/withdrawals skipped — imported via Excel
+        # Steps 2-3: deposits/withdrawals skipped -- imported via Excel
         # (API retention: 90 days only)
 
         # Step 4: convert trades

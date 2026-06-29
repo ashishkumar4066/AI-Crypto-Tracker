@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Scale, Database, FileSpreadsheet, Search, X, ArrowUpDown } from 'lucide-react'
-import YearFilter from '../components/YearFilter'
+import YearFilter, { allYears } from '../components/YearFilter'
 import { getTally } from '../api/client'
 
 const TYPE_COLORS = {
@@ -86,7 +86,7 @@ function ComparisonBar({ apiCount, excelCount, label }) {
 }
 
 export default function Tally({ exchange, exchangeLabel }) {
-  const [selectedYears, setSelectedYears] = useState(['2024-25'])
+  const [selectedYears, setSelectedYears] = useState(() => allYears)
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [filterAsset, setFilterAsset] = useState('')

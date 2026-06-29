@@ -18,107 +18,22 @@ from sqlalchemy.orm import Session
 from src.config import FY_DATE_RANGES
 from src.db.database import get_db
 from src.db.models import Transaction
+from src.exchanges.binance.wallets import (
+    WALLET_META,
+    ACTION_TYPE_MAP,
+    ACTION_LABELS,
+    COL_ORDER,
+    wallet_id as _wallet_id,
+    get_wallet_meta as _wallet_meta,
+    edge_color as _edge_color,
+)
 
 router = APIRouter()
-
-# ---------------------------------------------------------------------------
-# Wallet display config
-# ---------------------------------------------------------------------------
-
-_WALLET_META: dict[str, dict[str, str]] = {
-    "binance_spot": {
-        "label": "Binance Spot",
-        "subtitle": "Trading Wallet",
-        "icon": "candlestick-chart",
-        "variant": "exchange",
-    },
-    "binance_p2p": {
-        "label": "Binance P2P",
-        "subtitle": "P2P Wallet",
-        "icon": "wallet",
-        "variant": "exchange",
-    },
-    "binance_convert": {
-        "label": "Binance Convert",
-        "subtitle": "Convert",
-        "icon": "wallet",
-        "variant": "exchange",
-    },
-    "binance_fiat": {
-        "label": "Binance Fiat",
-        "subtitle": "Fiat Gateway",
-        "icon": "landmark",
-        "variant": "source",
-    },
-    "inr_entry": {
-        "label": "Bank Account",
-        "subtitle": "INR Fiat",
-        "icon": "landmark",
-        "variant": "source",
-    },
-}
-
-_ACTION_TYPE_MAP: dict[str, str] = {
-    "BUY": "BUY",
-    "SELL": "SELL",
-    "P2P_BUY": "BUY",
-    "P2P_SELL": "SELL",
-    "DEPOSIT": "DEPOSIT",
-    "WITHDRAWAL": "WITHDRAWAL",
-    "CONVERT": "CONVERT",
-    "DUST_CONVERSION": "DUST",
-    "FIAT_BUY": "BUY",
-    "FIAT_SELL": "SELL",
-    "INTERNAL_TRANSFER": "INTERNAL_TRANSFER",
-}
-
-_ACTION_LABELS: dict[str, str] = {
-    "BUY": "Buy",
-    "SELL": "Sell",
-    "P2P_BUY": "P2P Buy",
-    "P2P_SELL": "P2P Sell",
-    "DEPOSIT": "Deposit",
-    "WITHDRAWAL": "Withdraw",
-    "CONVERT": "Convert",
-    "DUST_CONVERSION": "Dust Convert",
-    "FIAT_BUY": "Fiat Buy",
-    "FIAT_SELL": "Fiat Sell",
-    "INTERNAL_TRANSFER": "Transfer",
-}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _wallet_id(name: str) -> str:
-    if not name:
-        return "unknown"
-    if name.startswith("external_"):
-        addr = name[len("external_"):]
-        if len(addr) > 10:
-            return f"ext_{addr[:8]}"
-        return f"ext_{addr}"
-    return name.replace(" ", "_").lower()
-
-
-def _wallet_meta(wallet_id: str, raw_name: str) -> dict[str, str]:
-    if wallet_id in _WALLET_META:
-        return dict(_WALLET_META[wallet_id])
-    if wallet_id.startswith("ext_"):
-        return {
-            "label": f"External {wallet_id[4:8]}…",
-            "subtitle": "External Wallet",
-            "icon": "hard-drive",
-            "variant": "external",
-        }
-    return {
-        "label": raw_name or wallet_id,
-        "subtitle": "Wallet",
-        "icon": "wallet",
-        "variant": "exchange",
-    }
-
 
 def _fmt(val: float) -> str:
     if val >= 1_000:
@@ -207,19 +122,14 @@ def _build_graph(transactions: list[Transaction]) -> dict:
 
     # Step 3: Assign positions (column-based layout, left to right)
     # Determine column for each wallet based on role
-    _COL_ORDER = {
-        "inr_entry": 0,
-        "binance_p2p": 1,
-        "binance_fiat": 1,
-    }
     # All regular exchange wallets
     _EXCHANGE_COL = 2
     # Result/external wallets
     _RESULT_COL = 4
 
     def _col(wid: str) -> int:
-        if wid in _COL_ORDER:
-            return _COL_ORDER[wid]
+        if wid in COL_ORDER:
+            return COL_ORDER[wid]
         if wid.endswith("_result"):
             return _RESULT_COL
         if wid.startswith("ext_"):
@@ -261,7 +171,7 @@ def _build_graph(transactions: list[Transaction]) -> dict:
         if len(asset_list) > 8:
             extra = len(asset_list) - 7
             asset_list = asset_list[:7]
-            asset_list.append({"symbol": "…", "amount": f"+{extra} more"})
+            asset_list.append({"symbol": "...", "amount": f"+{extra} more"})
 
         col = _col(wid)
         row = col_y_counters[col]
@@ -290,8 +200,8 @@ def _build_graph(transactions: list[Transaction]) -> dict:
 
     for (txn_type, src_id, dst_id), txns in flows.items():
         action_id = f"act_{txn_type}_{src_id}_{dst_id}"
-        label_text = _ACTION_LABELS.get(txn_type, txn_type.replace("_", " ").title())
-        action_type_key = _ACTION_TYPE_MAP.get(txn_type, txn_type)
+        label_text = ACTION_LABELS.get(txn_type, txn_type.replace("_", " ").title())
+        action_type_key = ACTION_TYPE_MAP.get(txn_type, txn_type)
 
         # Aggregate: total amount and distinct assets
         total_amount = sum(t.amount or 0 for t in txns)
@@ -363,23 +273,6 @@ def _build_graph(transactions: list[Transaction]) -> dict:
         )
 
     return {"nodes": nodes, "edges": edges}
-
-
-def _edge_color(txn_type: str, direction: str) -> str:
-    colors = {
-        "BUY": "#10b981",
-        "P2P_BUY": "#10b981",
-        "FIAT_BUY": "#10b981",
-        "SELL": "#f43f5e",
-        "P2P_SELL": "#f43f5e",
-        "FIAT_SELL": "#f43f5e",
-        "DEPOSIT": "#3b82f6",
-        "WITHDRAWAL": "#f59e0b",
-        "CONVERT": "#8b5cf6",
-        "DUST_CONVERSION": "#9ca3af",
-        "INTERNAL_TRANSFER": "#0ea5e9",
-    }
-    return colors.get(txn_type, "#6b7280")
 
 
 # ---------------------------------------------------------------------------

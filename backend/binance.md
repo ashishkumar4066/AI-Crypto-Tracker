@@ -1,634 +1,333 @@
-# BINANCE.md — Binance Data Extraction & Reconciliation Module
+# BINANCE.MD — Binance Data Extraction & Import Module
 
 ## Project Context
 
-Building a production-grade crypto portfolio tracker that replaces Koinly. This module handles complete data extraction from Binance using the REST API with API Key + HMAC-SHA256 authentication.
+Production-grade crypto portfolio tracker replacing Koinly. This module handles complete data extraction from Binance via two channels:
 
-**Why this exists:** Koinly misclassifies internal transfers as trades, creating phantom balances. Our portfolio showed ₹1L in Koinly vs ₹2L actual — a 100% error caused by transfer-matching failures. This module fetches raw data with full transaction IDs and hashes so we can build accurate reconciliation ourselves.
+1. **API Sync** — Real-time data from Binance REST API (spot trades, dust, convert, fiat orders)
+2. **Excel Import** — Historical data from Binance Data Download Center (C2C, deposits, withdrawals, transaction history, spot trades/orders)
 
-**Scope of this file:** Binance only. Once this works end-to-end, we replicate the pattern for WazirX, CoinDCX, and Mudrex (see `architecture.md`).
+**Why two channels:** Binance API has retention limits that delete old data:
+- Deposits/Withdrawals: 90-day retention
+- C2C/P2P: 6-month retention
+- Spot trades via `myTrades`: No retention limit (full history available)
+
+Koinly has the same limitation — it calls these same APIs and silently misses historical P2P trades, causing portfolio valuation errors (₹1L shown vs ₹2L actual).
 
 ---
 
 ## Tech Stack
 
 - **Language:** Python 3.11+
-- **HTTP:** `requests` (raw, no SDK wrapper — we want full control over signing and pagination)
-- **Storage:** SQLite (local dev) → PostgreSQL (Supabase) for production
-- **Schema:** Unified transaction ledger (see Data Model section)
+- **HTTP:** `requests` (raw, no SDK — full control over signing and pagination)
+- **Storage:** SQLite via SQLAlchemy ORM (`backend/data/crypto_tracker.db`)
+- **API Framework:** FastAPI with async file upload support
+- **Excel Parsing:** `openpyxl` for .xlsx files
 - **Auth:** HMAC-SHA256 signed requests (API Key + Secret via env vars)
-- **Rate Limiting:** Built-in delay + retry with exponential backoff
+- **Rate Limiting:** 150ms minimum gap between API calls + exponential backoff on 429
 
 ---
 
 ## API Key Setup
 
-1. Log into Binance → Account → API Management
-2. Click **"Create Tax Report API"** (read-only, no trading/withdrawal permissions)
-3. Under IP Access Restrictions, select **"Unrestricted"** (or whitelist your server IP)
-4. Save the API Key and Secret Key immediately — the secret is shown only once
-5. Store as environment variables:
-
-```bash
-export BINANCE_API_KEY="your_key_here"
-export BINANCE_API_SECRET="your_secret_here"
-```
-
-**Security rules:**
-
-- Never commit keys to git (use `.env` file with `.gitignore`)
-- Tax Report API keys cannot initiate trades or withdrawals — safe for data extraction
-- Rotate keys every 90 days
+1. Binance → Account → API Management → **Create Tax Report API** (read-only)
+2. Store as environment variables in `backend/.env`:
+   ```
+   BINANCE_API_KEY=your_key_here
+   BINANCE_API_SECRET=your_secret_here
+   ```
 
 ---
 
-## Data Categories & API Endpoints
+## Data Sources & API Retention Limits
 
-There are **8 categories** of data in a Binance account. Missing any one of them causes reconciliation errors. Each is detailed below with endpoint, params, response schema, pagination strategy, and known gotchas.
+### Channel 1: API Sync (via `sync_all()`)
 
-### 1. Account Balances
+These endpoints are called during API sync. They have no meaningful retention limits or the limits don't matter for our use case.
 
-**Purpose:** Current holdings snapshot + coin discovery for trade history extraction.
+| # | Endpoint | What | Retention | Chunking | Status |
+|---|----------|------|-----------|----------|--------|
+| 1 | `GET /sapi/v1/fiat/orders` | Fiat bank buy/sell | Not documented | Page-based | ✅ Active |
+| 2 | `GET /sapi/v1/asset/dribblet` | Dust → BNB conversions | Not documented | 90-day chunks | ✅ Active |
+| 3 | `GET /sapi/v1/convert/tradeFlow` | Convert trades | "Max interval 30 days" | 30-day chunks | ✅ Active |
+| 4 | `GET /api/v3/myTrades` | Spot trade fills | **No limit** | fromId pagination | ✅ Active |
+| 5 | `GET /api/v3/account` | Current balances | N/A (live) | Single call | ✅ Symbol discovery only |
+| 6 | `GET /api/v3/exchangeInfo` | Valid trading pairs | N/A (live) | Single call | ✅ Symbol validation |
 
-```
-GET /api/v3/account
-```
+### Channel 2: Excel Import (removed from API sync)
 
-| Param            | Type    | Required | Notes                           |
-| ---------------- | ------- | -------- | ------------------------------- |
-| omitZeroBalances | BOOLEAN | No       | Set `true` to skip empty assets |
-| recvWindow       | DECIMAL | No       | Max 60000                       |
-| timestamp        | LONG    | Yes      | Server time in ms               |
+These endpoints have confirmed retention limits. Data is imported from Binance Data Download Center Excel exports instead.
 
-**Response fields we use:**
+| # | Endpoint | Retention Limit (from Binance docs) | Import Source |
+|---|----------|-------------------------------------|---------------|
+| 1 | `GET /sapi/v1/capital/deposit/hisrec` | **"Default startTime: 90 days from current timestamp"** | Excel: Deposit History |
+| 2 | `GET /sapi/v1/capital/withdraw/history` | **"Default startTime: 90 days from current timestamp"** | Excel: Withdraw History |
+| 3 | `GET /sapi/v1/c2c/orderMatch/listUserOrderHistory` | **"You can only view data from the past 6 months"** | Excel: C2C Order History |
 
-```json
-{
-  "balances": [
-    {
-      "asset": "BTC",
-      "free": "0.00234500",
-      "locked": "0.00000000"
-    }
-  ],
-  "uid": 354937868
-}
-```
-
-**Pagination:** None needed — returns all assets in one call.
-
-**Gotcha:** This only shows CURRENT balances. Coins you fully sold will not appear here. That's why we also mine deposit/withdrawal history for coin discovery (see Symbol Discovery Strategy below).
+**Source:** https://developers.binance.com/docs/c2c/rest-api, https://developers.binance.com/docs/wallet/capital/deposite-history, https://developers.binance.com/docs/wallet/capital/withdraw-history
 
 ---
 
-### 2. Spot Trade History
+## Excel Import — Supported File Types
 
-**Purpose:** Every buy/sell executed on the spot exchange. This is where your cost basis originates.
+`POST /api/v1/import/excel` accepts bulk .xlsx uploads from Binance Data Download Center. Auto-detects type from Row 3 of each file.
 
-```
-GET /api/v3/myTrades
-```
+### File Format (all types)
+- Rows 1-9: Binance branding, user info, period metadata
+- Row 10: Column headers
+- Row 11+: Data rows
 
-| Param     | Type   | Required | Notes                                            |
-| --------- | ------ | -------- | ------------------------------------------------ |
-| symbol    | STRING | **Yes**  | e.g., "BTCUSDT" — must query per pair            |
-| orderId   | LONG   | No       | Filter by specific order                         |
-| startTime | LONG   | No       | **24-hour max window with endTime**              |
-| endTime   | LONG   | No       | **24-hour max window with startTime**            |
-| fromId    | LONG   | No       | TradeId to paginate from (gets trades >= fromId) |
-| limit     | INT    | No       | Default 500, Max 1000                            |
-| timestamp | LONG   | Yes      |                                                  |
+### Supported Types & Column Mappings
 
-**Response fields we use:**
+#### 1. C2C Order History
+**Detection:** Row 3 contains "C2C"
+**Headers:** `Order Number | Order Type | Asset | Fiat Type | Total Price | Price | Quantity | Exchange rate | Maker Fee | Taker Fee | Counterparty | Status | Created Time`
 
-```json
-{
-  "symbol": "BNBBTC",
-  "id": 28457,
-  "orderId": 100234,
-  "orderListId": -1,
-  "price": "4.00000100",
-  "qty": "12.00000000",
-  "quoteQty": "48.000012",
-  "commission": "10.10000000",
-  "commissionAsset": "BNB",
-  "time": 1499865549590,
-  "isBuyer": true,
-  "isMaker": false,
-  "isBestMatch": true
-}
-```
+| Excel Column | → Transaction Field |
+|---|---|
+| Order Number | external_id |
+| Order Type | type ("Buy"→P2P_BUY, "Sell"→P2P_SELL) |
+| Asset | asset |
+| Fiat Type | counter_asset (INR) |
+| Total Price | quote_amount |
+| Price | price |
+| Quantity | amount |
+| Maker Fee + Taker Fee | fee (summed) |
+| Created Time | datetime |
 
-**Pagination strategy:** Use `fromId`, NOT time-based pagination.
+Filters: Only `Status = "Completed"` rows imported.
+Source endpoint: `excel_c2c`
 
-- Time-based is capped at 24-hour windows — useless for 5+ years of history
-- `fromId` has no time limit: fetch batch, take last `id + 1`, fetch next batch
-- Stop when response returns fewer than `limit` records
+#### 2. Deposit History
+**Detection:** Row 3 contains "Deposit"
+**Headers:** `Time | Coin | Network | Amount | Address | TXID | Status`
 
-**Gotcha — Symbol requirement:** This endpoint requires a `symbol` param. You cannot say "give me all trades." You must know which pairs you traded and query each one separately. See Symbol Discovery Strategy below.
+| Excel Column | → Transaction Field |
+|---|---|
+| TXID | external_id, txhash |
+| Coin | asset |
+| Amount | amount |
+| Network | network |
+| Address | address |
+| Time | datetime |
 
-**Gotcha — Missing trades:** If you used Binance Convert (simple buy/sell), those trades do NOT appear in `myTrades`. They only appear in `/sapi/v1/convert/tradeFlow`. This is the #1 reason Koinly misses transactions.
+Filters: Only rows with non-empty TXID.
+Source endpoint: `excel_deposit`
 
----
+#### 3. Withdraw History
+**Detection:** Row 3 contains "Withdraw"
+**Headers:** `Time | Coin | Network | Amount | Fee | Address | TXID | Status`
 
-### 3. Deposit History (contains TxHash)
+Same as deposits plus `Fee` column.
+Source endpoint: `excel_withdrawal`
 
-**Purpose:** Every coin that entered your Binance account. The `txId` field is the on-chain Transaction Hash — your primary join key for cross-wallet reconciliation.
+#### 4. Spot Trade History
+**Detection:** Row 3 contains "Spot Trade"
+**Headers:** `Time | Pair | Side | Price | Executed | Amount | Fee`
 
-```
-GET /sapi/v1/capital/deposit/hisrec
-```
+**Special parsing:** Values have embedded units (e.g., `82.9USUAL`, `72.123USDT`). The `_split_amount_unit()` function extracts number and asset symbol.
 
-| Param         | Type    | Required | Notes                                                                      |
-| ------------- | ------- | -------- | -------------------------------------------------------------------------- |
-| includeSource | BOOLEAN | No       | Set `true` to get `sourceAddress` — **always set this**                    |
-| coin          | STRING  | No       | Filter by specific coin                                                    |
-| status        | INT     | No       | 0=pending, 1=success, 6=credited-cant-withdraw, 7=wrong, 8=waiting-confirm |
-| startTime     | LONG    | No       | Default: 90 days ago                                                       |
-| endTime       | LONG    | No       | Default: now                                                               |
-| offset        | INT     | No       | Default 0                                                                  |
-| limit         | INT     | No       | Default 1000, Max 1000                                                     |
-| txId          | STRING  | No       | Search by specific TxHash                                                  |
-| timestamp     | LONG    | Yes      |                                                                            |
+| Excel Column | → Transaction Field |
+|---|---|
+| Time | datetime |
+| Side | type (BUY/SELL) |
+| Executed | amount + asset (parsed from "82.9USUAL") |
+| Amount | quote_amount + counter_asset (parsed from "72.123USDT") |
+| Fee | fee + fee_asset (parsed) |
+| Price | price |
 
-**Response fields we use:**
+Source endpoint: `excel_spot_trade`
 
-```json
-{
-  "id": "769800519366885376",
-  "amount": "0.001",
-  "coin": "BNB",
-  "network": "BNB",
-  "status": 1,
-  "address": "bnb136ns6lfw4zs5hg4n85vdthaad7hq5m4gtkgf23",
-  "addressTag": "101764890",
-  "txId": "98A3EA560C6B3336D348B6C83F0F95ECE4F1F5919E94BD006E5BF3BF264FACFC",
-  "insertTime": 1661493146000,
-  "completeTime": 1661493146000,
-  "transferType": 0,
-  "confirmTimes": "1/1",
-  "unlockConfirm": 0,
-  "walletType": 0,
-  "sourceAddress": "0x1234...",
-  "travelRuleStatus": 0
-}
-```
+#### 5. Spot Order History
+**Detection:** Row 3 contains "Spot Order"
+**Headers:** `Time | OrderNo | Pair | Type | Side | Order Price | Order Amount | Time | Executed | Average Price | Trading total | Status`
 
-**Critical fields for reconciliation:**
+Filters: Only `Status IN (FILLED, PARTIALLY_FILLED)`.
+Note: Headers contain invisible BOM characters — parser uses fuzzy matching.
+Source endpoint: `excel_spot_order`
 
-- `txId` — the on-chain TxHash. Paste this into BscScan/Etherscan to verify. This is your JOIN KEY when matching with MetaMask or other wallet records.
-- `sourceAddress` — where the coins came FROM (only when `includeSource=true`)
-- `transferType` — 0 = external (from another wallet/exchange), 1 = internal (Binance-to-Binance)
-- `network` — which blockchain (BNB, ETH, TRX, SOL, etc.)
-- `walletType` — 0 = Spot Wallet, 1 = Funding Wallet
+#### 6. Convert Order History
+**Detection:** Row 3 contains "Convert"
+Source endpoint: `excel_convert`
 
-**Pagination strategy:** 90-day chunked windows + offset.
+#### 7. Transaction History (Master Ledger)
+**Detection:** Row 3 contains "Transaction"
+**Headers:** `User ID | Time | Account | Operation | Coin | Change | Remark`
 
-- `startTime` to `endTime` cannot exceed 90 days
-- Walk forward in 89-day chunks from `HISTORY_START` to now
-- Within each chunk, paginate via `offset` (0, 1000, 2000...) until response < 1000
+Maps 26 unique Operation types to transaction types:
 
----
+| Operation | → Type |
+|---|---|
+| Transaction Buy | BUY |
+| Transaction Spend / Transaction Sold | SELL |
+| Transaction Fee / Fee / Funding Fee | FEE |
+| Transaction Revenue | REWARD |
+| P2P Trading | P2P_BUY (positive Change) / P2P_SELL (negative) |
+| Deposit | DEPOSIT |
+| Withdraw | WITHDRAWAL |
+| Binance Convert | CONVERT |
+| Small Assets Exchange BNB | DUST_CONVERSION |
+| Distribution / Airdrop Assets / Commission Rebate / Crypto Box | REWARD |
+| Launchpool Airdrop - User Claim Distribution | REWARD |
+| Launchpool Subscription/Redemption / Simple Earn Flexible * | STAKING |
+| Token Swap - Distribution / Redenomination/Rebranding | CONVERT |
+| Transfer Between Spot and Funding/UM Futures | INTERNAL_TRANSFER |
+| Asset Recovery | REWARD |
+| Realized Profit and Loss | REWARD |
 
-### 4. Withdrawal History (contains TxHash)
-
-**Purpose:** Every coin that left your Binance account. The `txId` is the on-chain TxHash for matching with the receiving wallet.
-
-```
-GET /sapi/v1/capital/withdraw/history
-```
-
-| Param           | Type   | Required | Notes                                                           |
-| --------------- | ------ | -------- | --------------------------------------------------------------- |
-| coin            | STRING | No       | Filter by coin                                                  |
-| withdrawOrderId | STRING | No       | Client-side ID if provided during withdrawal                    |
-| status          | INT    | No       | 0=Email Sent, 2=Awaiting, 3=Rejected, 4=Processing, 6=Completed |
-| offset          | INT    | No       |                                                                 |
-| limit           | INT    | No       | Default 1000, Max 1000                                          |
-| startTime       | LONG   | No       | Default: 90 days ago                                            |
-| endTime         | LONG   | No       | Default: now                                                    |
-| timestamp       | LONG   | Yes      |                                                                 |
-
-**Response fields we use:**
-
-```json
-{
-  "id": "b6ae22b3aa844210a7041aee7589627c",
-  "amount": "8.91000000",
-  "transactionFee": "0.004",
-  "coin": "USDT",
-  "status": 6,
-  "address": "0x94df8b352de7f46f64b01d3666bf6e936e44ce60",
-  "txId": "0xb5ef8c13b968a406cc62a93a8bd80f9e9a906ef1b3fcf20a2e48573c17659268",
-  "applyTime": "2019-10-12 11:12:02",
-  "network": "ETH",
-  "transferType": 0,
-  "withdrawOrderId": "WITHDRAWtest123",
-  "info": "reason for failure if any",
-  "confirmNo": 3,
-  "walletType": 1,
-  "txKey": "",
-  "completeTime": "2023-03-23 16:52:41"
-}
-```
-
-**Critical fields for reconciliation:**
-
-- `txId` — on-chain TxHash. Match this with the deposit record on the receiving exchange/wallet.
-- `address` — destination address (your MetaMask, CoinDCX deposit address, etc.)
-- `transactionFee` — the network fee deducted. Amount received = `amount - transactionFee`
-- `transferType` — 0 = external, 1 = internal (Binance-to-Binance)
-
-**Pagination:** Same 90-day chunked strategy as deposits.
-
-**Gotcha — Internal transfers:** Since May 2024, internal transfer txIds are prefixed with "Off-chain transfer" instead of the old "internal transfer" flag. This applies retroactively to historical data.
+Account field maps to wallets: Spot→`binance_spot`, Funding→`binance_funding`, UM Futures→`binance_futures`
+Source endpoint: `excel_transaction_history`
 
 ---
 
-### 5. P2P / C2C Trade History
+## API vs Excel Data Separation
 
-**Purpose:** Your INR on-ramp and off-ramp. Every time you bought crypto with INR or sold crypto for INR via Binance P2P.
+All data goes into one unified `transactions` table. The `source_endpoint` column distinguishes origin:
 
-```
-GET /sapi/v1/c2c/orderMatch/listUserOrderHistory
-```
+| Source | source_endpoint values |
+|--------|----------------------|
+| **API Sync** | `spot_trade`, `fiat_order`, `dust`, `convert` |
+| **Excel Import** | `excel_c2c`, `excel_deposit`, `excel_withdrawal`, `excel_spot_trade`, `excel_spot_order`, `excel_convert`, `excel_transaction_history` |
 
-| Param     | Type   | Required | Notes                                        |
-| --------- | ------ | -------- | -------------------------------------------- |
-| tradeType | STRING | **Yes**  | "BUY" or "SELL" — must query each separately |
-| page      | INT    | No       | Default 1                                    |
-| rows      | INT    | No       | Default 100                                  |
-| timestamp | LONG   | Yes      |                                              |
+**Deduplication key:** `(exchange, source_endpoint, external_id)` — prevents duplicate imports but allows the same transaction to exist from both API and Excel sources for tallying/comparison.
 
-**Response fields we use:**
-
-```json
-{
-  "orderNumber": "20219644646554779648",
-  "advNo": "11218246497340923904",
-  "tradeType": "SELL",
-  "asset": "USDT",
-  "fiat": "INR",
-  "fiatSymbol": "₹",
-  "amount": "343.40000000",
-  "totalPrice": "2500.00000000",
-  "unitPrice": "7.28",
-  "orderStatus": "COMPLETED",
-  "createTime": 1722997599534,
-  "commission": "0",
-  "counterPartNickName": "aaa-***",
-  "payMethodName": "BANK"
-}
-```
-
-**Why this matters for ITR:**
-
-- P2P BUY = your acquisition cost in INR (cost basis)
-- P2P SELL = your disposal value in INR (taxable event)
-- `totalPrice` in INR is what you report on Schedule VDA
-
-**Pagination:** Page-based. Increment `page` until response is empty.
+**Tally endpoint:** `GET /api/v1/import/tally?fy=2024-25&asset=BTC` compares counts between API and Excel by type, by coin, and by source.
 
 ---
 
-### 6. Fiat Order History
+## Symbol Discovery Pipeline
 
-**Purpose:** Direct bank deposit/withdrawal (not P2P). Less common in India but still needs tracking.
+The `myTrades` endpoint requires a `symbol` param — you cannot request "all trades." Discovery pipeline:
 
 ```
-GET /sapi/v1/fiat/orders
+Step 1: GET /api/v3/account → coins with balance > 0
+Step 2: Scan convert trades → fromAsset + toAsset coins
+Step 3: Scan dust conversions → fromAsset coins
+Step 4: Union with MANUAL_COINS (131 hardcoded coins in config.py)
+Step 5: Cross-product with QUOTE_ASSETS → candidate symbols
+Step 6: Validate against GET /api/v3/exchangeInfo → filter to real pairs
+Step 7: Query myTrades for each valid pair (fromId pagination)
 ```
 
-| Param           | Type | Required | Notes                                  |
-| --------------- | ---- | -------- | -------------------------------------- |
-| transactionType | INT  | **Yes**  | 0 = deposit (buy), 1 = withdraw (sell) |
-| page            | INT  | No       |                                        |
-| rows            | INT  | No       | Max 500                                |
-| timestamp       | LONG | Yes      |                                        |
+**QUOTE_ASSETS:** `USDT, BTC, BNB, ETH, BUSD, FDUSD, USDC, INR`
 
-**Pagination:** Page-based, query both `transactionType=0` and `transactionType=1`.
+**Note:** Deposits and withdrawals are NOT used for symbol discovery (removed due to 90-day API retention). The MANUAL_COINS list compensates.
 
 ---
 
-### 7. Dust Conversions
+## Unified Transaction Schema
 
-**Purpose:** When you convert small leftover amounts of various coins to BNB. These create tiny cost basis entries that Koinly typically misses, causing unexplained balance gaps.
+Every record from every source (API or Excel) is normalized into this schema:
 
-```
-GET /sapi/v1/asset/dribblet
-```
-
-| Param     | Type | Required | Notes |
-| --------- | ---- | -------- | ----- |
-| startTime | LONG | No       |       |
-| endTime   | LONG | No       |       |
-| timestamp | LONG | Yes      |       |
-
-**Response structure:** Nested — each `userAssetDribblets` entry contains multiple `userAssetDribbletDetails` (one per coin converted).
-
-**Pagination:** 90-day chunks (same pattern as deposits/withdrawals).
-
----
-
-### 8. Convert Trade History
-
-**Purpose:** Trades made via Binance's "Convert" feature (simple buy/sell UI). These do NOT appear in `myTrades` — this is the most commonly missed data source and a major reason Koinly gets numbers wrong.
-
-```
-GET /sapi/v1/convert/tradeFlow
-```
-
-| Param     | Type | Required | Notes                 |
-| --------- | ---- | -------- | --------------------- |
-| startTime | LONG | **Yes**  |                       |
-| endTime   | LONG | **Yes**  | Max 30-day window     |
-| limit     | INT  | No       | Default 100, Max 1000 |
-| timestamp | LONG | Yes      |                       |
-
-**Response fields:**
-
-```json
-{
-  "quoteId": "ab12cd",
-  "orderId": 123456,
-  "orderStatus": "SUCCESS",
-  "fromAsset": "USDT",
-  "fromAmount": "100.00000000",
-  "toAsset": "BNB",
-  "toAmount": "0.34500000",
-  "ratio": "0.00345",
-  "inverseRatio": "289.855",
-  "createTime": 1623381330000
-}
-```
-
-**Pagination:** 30-day chunks (stricter than the 90-day endpoints).
-
-- Walk forward in 29-day chunks from `HISTORY_START` to now
-- Within each chunk, if response returns `limit` records, paginate using the last `orderId` as cursor
-- Stop when response returns fewer than `limit` records
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT | uuid4 primary key |
+| `datetime` | TEXT | ISO-8601 UTC timestamp |
+| `type` | TEXT | BUY, SELL, DEPOSIT, WITHDRAWAL, P2P_BUY, P2P_SELL, CONVERT, DUST_CONVERSION, FEE, REWARD, STAKING, INTERNAL_TRANSFER, FIAT_BUY, FIAT_SELL |
+| `asset` | TEXT | Primary coin (BTC, ETH, SOL, etc.) |
+| `amount` | FLOAT | Quantity of primary coin |
+| `fee` | FLOAT | Fee paid |
+| `fee_asset` | TEXT | Currency of the fee (BNB, USDT, etc.) |
+| `price` | FLOAT | Per-unit price in counter_asset |
+| `quote_amount` | FLOAT | Total value in counter_asset |
+| `counter_asset` | TEXT | Quote currency (USDT, INR, BTC, etc.) |
+| `price_inr` | FLOAT | Resolved INR price (for tax — not yet implemented) |
+| `value_inr` | FLOAT | Total INR value (not yet implemented) |
+| `txhash` | TEXT | On-chain Transaction Hash |
+| `network` | TEXT | Blockchain network |
+| `address` | TEXT | Wallet address |
+| `source_wallet` | TEXT | From wallet (binance_spot, binance_p2p, external, etc.) |
+| `dest_wallet` | TEXT | To wallet |
+| `transfer_type` | INT | 0=external, 1=internal |
+| `source_endpoint` | TEXT | Data origin (spot_trade, excel_c2c, etc.) |
+| `exchange` | TEXT | Always "binance" for this module |
+| `external_id` | TEXT | Exchange's ID for deduplication |
+| `order_id` | TEXT | Associated order ID |
+| `status` | TEXT | COMPLETED, FILLED, etc. |
+| `raw_json` | TEXT | Original data for audit |
 
 ---
 
-## Symbol Discovery Strategy
+## API Endpoints
 
-The `myTrades` endpoint requires a `symbol` param — you can't request "all trades." The challenge is discovering which symbols you've ever traded, especially coins you fully sold (zero balance now).
+All under `/api/v1` prefix.
 
-**Multi-source discovery pipeline:**
+### Sync
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/sync` | Trigger API extraction for a FY. Body: `{"fy": "2024-25"}` |
+| GET | `/sync/status` | Check per-phase sync results. Query: `?fy=2024-25` |
 
-```
-Step 1: GET /api/v3/account → extract all assets with balance > 0
-Step 2: GET /sapi/v1/capital/deposit/hisrec → extract all deposited coins
-Step 3: GET /sapi/v1/capital/withdraw/history → extract all withdrawn coins
-Step 4: GET /sapi/v1/convert/tradeFlow → extract all fromAsset and toAsset
-Step 5: GET /sapi/v1/asset/dribblet → extract all dust-converted coins
-Step 6: Union with MANUAL_COINS list (coins you remember trading)
-Step 7: Cross-product with QUOTE_ASSETS → candidate symbol list
-Step 8: Validate against GET /api/v3/exchangeInfo → filter to real pairs
-Step 9: Query myTrades for each valid pair
-```
+### Transactions
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/transactions` | Paginated query. Filters: `?fy=&asset=&type=&source=excel|api&page=&limit=` |
+| GET | `/holdings` | Current asset balance snapshot (credits - debits) |
+| GET | `/financial-years` | List FY periods with transaction counts |
 
-**MANUAL_COINS list:** For coins that were only spot-traded and fully sold (no deposit/withdrawal/convert record), add them manually:
+### Graph (React Flow format)
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/graph/overview` | Full coin-flow graph. Filter: `?fy=` |
+| GET | `/graph/asset/{asset}` | Per-asset flow graph. Filter: `?fy=` |
 
-```python
-MANUAL_COINS = {
-     "SOL",
-  "ETH",
-  "TRX",
-  "TAO",
-  "LINK",
-  "FET",
-  "ADA",
-  "ONDO",
-  "MATIC",
-  "AVAX",
-  "NEAR",
-  "AERO",
-  "DOGE",
-  "RENDER",
-  "SUI",
-  "AR",
-  "SUPER",
-  "AKT",
-  "TON",
-  "PENDLE",
-  "XRP",
-  "ALGO",
-  "PYTH",
-  "ATH",
-  "SEI",
-  "ZK",
-  "OCEAN",
-  "GALA",
-  "ARB",
-  "VANRY",
-  "APT",
-  "JOE",
-  "MOG",
-  "WMTX",
-  "NUM",
-  "CPOOL",
-  "AGI",
-  "INJ",
-  "RUNE",
-  "MANA",
-  "BEAM",
-  "SAND",
-  "GHX",
-  "LUMIA",
-  "COQ",
-  "ILV",
-  "SHIB",
-  "WILD",
-  "GAME",
-  "BRETT",
-  "ORN",
-  "APE",
-  "SUNDOG",
-  "HEART",
-  "GOAT",
-  "CTSI",
-  "OP",
-  "TAI",
-  "IO",
-  "PAAL",
-  "FOXY",
-  "ZEREBRO",
-  "EOS",
-  "GRIFFAIN",
-  "USUAL",
-  "SFUND",
-  "G3",
-  "NTRN",
-  "MONKY",
-  "SHRAP",
-  "MARCO",
-  "CWIF",
-  "NFT",
-  "SOLO",
-  "ETHW",
-  "LUNA",
-  "AI",
-  "LEMX",
-  "AGIX",
-  "PEPE",
-  "PUMP"
-}
-```
+### Import
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/import/excel` | Bulk upload .xlsx files (multipart). Auto-detects type. |
+| GET | `/import/tally` | API vs Excel comparison. Filters: `?fy=&asset=` |
 
-**QUOTE_ASSETS to pair against:**
-
-```python
-QUOTE_ASSETS = ["USDT", "BTC", "BNB", "ETH", "BUSD", "FDUSD", "USDC", "INR"]
-```
+### Health
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Returns `{"status": "ok"}` |
 
 ---
 
-## Unified Transaction Ledger Schema
+## Known Data Overlap
 
-Every record from every endpoint gets normalized into this schema before storage:
+Importing multiple Excel export types creates duplicate records for the same trade:
 
-| Column          | Type      | Description                                                                                                                               | Source                                            |
-| --------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| `id`            | UUID      | Internal primary key                                                                                                                      | Generated                                         |
-| `datetime`      | TIMESTAMP | When the event occurred (UTC)                                                                                                             | `time`, `insertTime`, `applyTime`, `createTime`   |
-| `type`          | ENUM      | `BUY`, `SELL`, `DEPOSIT`, `WITHDRAWAL`, `P2P_BUY`, `P2P_SELL`, `FIAT_BUY`, `FIAT_SELL`, `DUST_CONVERSION`, `CONVERT`, `REWARD`, `INTERNAL_TRANSFER`, `UNKNOWN` | Derived                                           |
-| `asset`         | VARCHAR   | The primary coin                                                                                                                          | `coin`, `asset`, `symbol` (parsed)                |
-| `amount`        | DECIMAL   | Quantity of the primary coin                                                                                                              | `qty`, `amount`                                   |
-| `fee`           | DECIMAL   | Fee paid                                                                                                                                  | `commission`, `transactionFee`                    |
-| `fee_asset`     | VARCHAR   | Currency of the fee                                                                                                                       | `commissionAsset`, same as `coin`                 |
-| `price`         | DECIMAL   | Unit price (in counter asset)                                                                                                             | `price`, `unitPrice`, `ratio`                     |
-| `quote_amount`  | DECIMAL   | Total value in counter asset                                                                                                              | `quoteQty`, `totalPrice`, `fromAmount`/`toAmount` |
-| `counter_asset` | VARCHAR   | The quote/fiat currency                                                                                                                   | Parsed from symbol, `fiat`, `fromAsset`/`toAsset` |
-| `txhash`        | VARCHAR   | On-chain Transaction Hash                                                                                                                 | `txId` — **THE KEY FIELD**                        |
-| `network`       | VARCHAR   | Blockchain network                                                                                                                        | `network`                                         |
-| `address`       | VARCHAR   | Wallet address involved                                                                                                                   | `address`, `sourceAddress`                        |
-| `source_wallet` | VARCHAR   | Where coins came from                                                                                                                     | Derived from context                              |
-| `dest_wallet`   | VARCHAR   | Where coins went to                                                                                                                       | Derived from context                              |
-| `transfer_type` | INT       | 0=external, 1=internal                                                                                                                    | `transferType`                                    |
-| `source`        | VARCHAR   | Which endpoint provided this                                                                                                              | `spot_trade`, `deposit`, `withdrawal`, etc.       |
-| `exchange`      | VARCHAR   | Always "binance" for this module                                                                                                          | Hardcoded                                         |
-| `binance_id`    | VARCHAR   | Binance's internal ID                                                                                                                     | `id`, `orderNumber`, `orderId`                    |
-| `order_id`      | VARCHAR   | Associated order                                                                                                                          | `orderId`, `advNo`                                |
-| `status`        | VARCHAR   | Completion status                                                                                                                         | `status`, `orderStatus`                           |
-| `raw_json`      | JSONB     | Full original API response                                                                                                                | For debugging/audit                               |
-| `created_at`    | TIMESTAMP | When we ingested this record                                                                                                              | Generated                                         |
+| Actual Event | Appears In |
+|---|---|
+| 1 spot buy | Transaction History ("Transaction Buy" + "Transaction Fee"), Spot Trade History, Spot Order History |
+| 1 P2P buy | Transaction History ("P2P Trading"), C2C Order History |
+| 1 deposit | Transaction History ("Deposit"), Deposit History |
+
+These are stored as separate records (different `source_endpoint` values) intentionally — the Tally page lets users compare counts across sources to verify completeness.
+
+**Recommendation:** For tax calculations, use Transaction History as the single source of truth — it contains all operations. Use individual exports (Spot Trade, C2C, etc.) for verification only.
 
 ---
 
-## Transfer Matching Engine
+## Implementation Status
 
-This is the core differentiator over Koinly. After ingesting all data, run the matching algorithm:
-
-**Match signature:** A transfer between your own wallets has this fingerprint:
-
-- One WITHDRAWAL record + one DEPOSIT record
-- Same `asset` (coin)
-- Amount difference ≤ network gas fee (withdrawal `amount` - deposit `amount` ≈ withdrawal `transactionFee`)
-- Timestamp difference ≤ 30 minutes (configurable)
-- OR: same `txHash` appears in both records (strongest match)
-
-**Matching priority:**
-
-1. **Exact TxHash match** (withdrawal txId == deposit txId) → confidence 100%
-2. **Same asset + amount within fee tolerance + timestamp within 30min** → confidence 90%
-3. **Same asset + approximate amount + timestamp within 2 hours** → confidence 70%
-4. **Unmatched** → flag for manual review
-
-**What matching produces:**
-
-- Matched pairs get linked as `INTERNAL_TRANSFER` — NOT a taxable event
-- Cost basis carries forward from source wallet to destination wallet
-- Unmatched deposits without a corresponding withdrawal → potentially external income (airdrop, reward, payment received)
-- Unmatched withdrawals without a corresponding deposit → potentially sent to someone else, or to a wallet we haven't imported yet
-
----
-
-## Cost Basis Calculation (Indian VDA Rules)
-
-**Tax regime:** Section 115BBH — 30% flat on gains, no loss offset across assets, FIFO within each asset.
-
-**Calculation logic:**
-
-1. For each asset, maintain a FIFO queue of acquisition lots: `(datetime, quantity, cost_per_unit_inr, source)`
-2. Acquisition events: P2P_BUY, FIAT_BUY, CONVERT (to-side), DEPOSIT (only if it's an external acquisition, not internal transfer)
-3. Disposal events: P2P_SELL, FIAT_SELL, CONVERT (from-side), WITHDRAWAL (only if sent externally)
-4. Internal transfers: NOT a disposal — just move the lot from one wallet label to another
-5. Dust conversions: disposal of the source coin, acquisition of BNB
-6. For each disposal, dequeue lots FIFO and compute: `gain = disposal_value_inr - cost_basis_inr`
-
-**INR price source:** P2P trades give direct INR prices. For spot trades (e.g., DOGE/USDT), chain the price: DOGE→USDT rate × USDT→INR rate (from closest P2P trade or CoinGecko historical price API).
-
----
-
-## Edge Cases & Known Gotchas
-
-1. **Internal transfer txId prefix changed** (May 2024): Binance replaced "internal transfer" with "Off-chain transfer" prefix in txId for Binance-to-Binance transfers. This is retroactive — historical data also changed.
-
-2. **Convert trades missing from myTrades:** The Binance Convert feature (simple buy/sell) uses a completely separate order book. If you bought BNB using the Convert UI, it only appears in `/sapi/v1/convert/tradeFlow`, never in `/api/v3/myTrades`.
-
-3. **Dust conversions create phantom balances:** Converting 0.003 DOGE to BNB is a disposal of DOGE and acquisition of BNB. If not tracked, your DOGE balance in the ledger will be 0.003 too high and BNB will be short.
-
-4. **BUSD delisting:** Binance delisted BUSD. Historical trades in BUSD pairs still exist but BUSD is no longer a valid trading pair. The script handles this via `fromId` pagination (no need for the pair to currently be active).
-
-5. **Multiple wallet types:** Binance has Spot, Funding, Earn, and Margin wallets. Deposits/withdrawals can target different wallet types (`walletType` field). Internal transfers between these wallets (e.g., Spot→Funding) use `/sapi/v1/asset/transfer` — a separate endpoint to add later.
-
-6. **Rate limits:**
-   - Spot endpoints: IP-based weight limits (1200 weight/minute)
-   - Wallet endpoints: Some are UID-based (e.g., withdraw history: 18000 weight, max 10 req/sec)
-   - Build in 150ms delay between calls + exponential backoff on 429 responses
-
-7. **Timestamp synchronization:** Binance rejects requests where the timestamp differs from server time by more than `recvWindow` (default 5000ms). If your machine clock is off, fetch server time first: `GET /api/v3/time`.
-
----
-
-## Implementation Checklist
-
-### Phase 1 — Raw Extraction (Current)
-
+### ✅ Completed
 - [x] HMAC-SHA256 signing with timestamp
-- [x] Account balances endpoint
-- [x] Spot trades with fromId pagination
-- [x] Deposit history with 90-day chunking and includeSource
-- [x] Withdrawal history with 90-day chunking
-- [x] P2P/C2C trade history (both BUY and SELL)
-- [x] Fiat order history
-- [x] Dust conversion log
-- [ ] Convert trade flow (30-day chunks)
-- [ ] Internal wallet transfers (`/sapi/v1/asset/transfer`)
-- [x] Symbol discovery from balances + deposits + withdrawals
-- [x] MANUAL_COINS fallback for fully-sold spot-only coins
-- [x] Unified master ledger CSV export
+- [x] Spot trades with fromId pagination (no retention limit)
+- [x] Fiat order history (page-based)
+- [x] Dust conversion log (90-day chunks)
+- [x] Convert trade flow (30-day chunks)
+- [x] Symbol discovery (balances + convert + dust + MANUAL_COINS)
+- [x] Excel import for all 7 Binance Data Download Center export types
+- [x] Bulk file upload (multiple files in one request)
+- [x] Auto-detection of Excel export type from Row 3
+- [x] Embedded unit parsing for Spot Trade values (e.g., "82.9USUAL")
+- [x] Deduplication on (exchange, source_endpoint, external_id)
+- [x] API vs Excel data separation via `source_endpoint` prefix
+- [x] Tally endpoint for comparison
+- [x] React Flow graph visualization (5-column layout)
+- [x] Transaction explorer with filters (year, asset, type, source)
+- [x] Stat cards: Total Buys, Total Sells, P2P Invested (INR), Conversions, Total Fees (per-asset breakdown)
 
-### Phase 2 — Storage & Reconciliation
-
-- [ ] PostgreSQL schema creation (Supabase)
-- [ ] Idempotent upsert (deduplicate on `exchange + binance_id + source`)
-- [ ] Transfer matching engine (TxHash match → amount+time match → flag)
-- [ ] Confidence scoring on matches
-- [ ] Manual review queue for unmatched records
-- [ ] Cross-reference with Koinly export CSV
-
-### Phase 3 — Cost Basis & Tax
-
-- [ ] FIFO lot tracking per asset
-- [ ] INR price resolution (P2P direct, CoinGecko fallback)
-- [ ] Section 115BBH gain/loss calculation
-- [ ] Schedule VDA output format
-- [ ] TDS tracking (Section 194S, 1% TDS on transfers > ₹10K)
-
-### Phase 4 — Visualization
-
-- [ ] Transaction flow graph (mind map / expanding tree)
-- [ ] Per-asset P&L timeline
-- [ ] Wallet-to-wallet flow diagram
-- [ ] ITR-ready audit trail export
-
----
-
-## File Structure
-
-See `architecture.md` for the canonical project directory layout.
+### 🔲 Not Yet Implemented
+- [ ] Transfer matching engine (TxHash + fingerprint + fuzzy)
+- [ ] FIFO cost basis tracking
+- [ ] INR price resolution (P2P direct → CoinGecko fallback)
+- [ ] Section 115BBH tax calculation
+- [ ] Schedule VDA output
+- [ ] On-chain scanning (BSC, ETH, SOL)
+- [ ] WazirX, CoinDCX, Mudrex connectors
 
 ---
 
@@ -640,4 +339,3 @@ See `architecture.md` for the canonical project directory layout.
 - C2C/P2P: https://developers.binance.com/docs/c2c/rest-api
 - Convert: https://developers.binance.com/docs/convert/rest-api
 - Wallet Change Log: https://developers.binance.com/docs/wallet/change-log
-- python-binance (community SDK): https://github.com/sammchardy/python-binance

@@ -2,7 +2,7 @@ import { useState, useMemo, useEffect, useCallback } from 'react'
 import { Search, X, ArrowDownCircle, ArrowUpCircle, ArrowRightLeft, IndianRupee, Percent } from 'lucide-react'
 import TransactionTable from '../components/TransactionTable'
 import ImportSection from '../components/ImportSection'
-import YearFilter from '../components/YearFilter'
+import YearFilter, { allYears } from '../components/YearFilter'
 import { getTransactions } from '../api/client'
 
 const ITEMS_PER_PAGE = 10
@@ -21,7 +21,7 @@ const statCards = [
 ]
 
 export default function Transactions({ exchange, exchangeLabel }) {
-  const [selectedYears, setSelectedYears] = useState(['2024-25'])
+  const [selectedYears, setSelectedYears] = useState(() => allYears)
   const [transactions, setTransactions] = useState([])
   const [filterAsset, setFilterAsset] = useState('')
   const [filterType, setFilterType] = useState('')
