@@ -352,33 +352,38 @@ def _parse_transaction_history(headers: list[str], rows: list[list]) -> list[dic
     col = _col_map(headers)
     txns = []
 
-    _OP_TYPE_MAP = {
+    # Static types: operation always has one sign direction
+    _OP_STATIC = {
         "Transaction Buy": "BUY",
         "Transaction Spend": "SELL",
         "Transaction Sold": "SELL",
         "Transaction Fee": "FEE",
-        "Transaction Revenue": "REWARD",
-        "P2P Trading": "P2P_BUY",
+        "Transaction Revenue": "BUY",
         "Deposit": "DEPOSIT",
         "Withdraw": "WITHDRAWAL",
-        "Binance Convert": "CONVERT",
-        "Small Assets Exchange BNB": "DUST_CONVERSION",
-        "Distribution": "REWARD",
         "Airdrop Assets": "REWARD",
-        "Launchpool Airdrop - User Claim Distribution": "REWARD",
-        "Launchpool Subscription/Redemption": "STAKING",
+        "Distribution": "REWARD",
         "Commission Rebate": "REWARD",
         "Crypto Box": "REWARD",
-        "Token Swap - Distribution": "CONVERT",
-        "Token Swap - Redenomination/Rebranding": "CONVERT",
-        "Simple Earn Flexible Subscription": "STAKING",
-        "Simple Earn Flexible Redemption": "STAKING",
+        "Launchpool Airdrop - User Claim Distribution": "REWARD",
+        "Fee": "FEE",
+        "Simple Earn Flexible Subscription": "EARN_LOCK",
+        "Simple Earn Flexible Redemption": "EARN_UNLOCK",
         "Transfer Between Spot and Funding": "INTERNAL_TRANSFER",
         "Transfer Between Spot and UM Futures": "INTERNAL_TRANSFER",
-        "Asset Recovery": "REWARD",
-        "Fee": "FEE",
-        "Funding Fee": "FEE",
-        "Realized Profit and Loss": "REWARD",
+    }
+
+    # Sign-dependent types: (positive_type, negative_type)
+    _OP_SIGNED = {
+        "P2P Trading": ("P2P_BUY", "P2P_SELL"),
+        "Asset Recovery": ("TOKEN_SWAP_IN", "TOKEN_SWAP_OUT"),
+        "Token Swap - Distribution": ("TOKEN_SWAP_IN", "TOKEN_SWAP_OUT"),
+        "Token Swap - Redenomination/Rebranding": ("TOKEN_SWAP_IN", "TOKEN_SWAP_OUT"),
+        "Binance Convert": ("CONVERT_IN", "CONVERT_OUT"),
+        "Small Assets Exchange BNB": ("DUST_IN", "DUST_OUT"),
+        "Launchpool Subscription/Redemption": ("STAKING_UNLOCK", "STAKING_LOCK"),
+        "Realized Profit and Loss": ("FUTURES_PNL", "FUTURES_PNL"),
+        "Funding Fee": ("FUNDING_FEE_IN", "FEE"),
     }
 
     for row in rows:
@@ -392,11 +397,16 @@ def _parse_transaction_history(headers: list[str], rows: list[list]) -> list[dic
         remark = str(_cell(row, col, "Remark")).strip()
         time_str = str(_cell(row, col, "Time")).strip()
 
-        txn_type = _OP_TYPE_MAP.get(operation, "UNKNOWN")
+        is_positive = change_val >= 0
 
-        # P2P Trading: positive change = buy, negative = sell
-        if operation == "P2P Trading":
-            txn_type = "P2P_BUY" if change_val >= 0 else "P2P_SELL"
+        # Determine type from operation + sign
+        if operation in _OP_STATIC:
+            txn_type = _OP_STATIC[operation]
+        elif operation in _OP_SIGNED:
+            pos_type, neg_type = _OP_SIGNED[operation]
+            txn_type = pos_type if is_positive else neg_type
+        else:
+            txn_type = "UNKNOWN"
 
         # Determine wallet based on account
         wallet = "binance_spot"
@@ -414,7 +424,7 @@ def _parse_transaction_history(headers: list[str], rows: list[list]) -> list[dic
             src_wallet = wallet
             dst_wallet = "external"
         elif txn_type == "INTERNAL_TRANSFER":
-            if change_val > 0:
+            if is_positive:
                 src_wallet = "binance_funding"
                 dst_wallet = "binance_spot"
             else:

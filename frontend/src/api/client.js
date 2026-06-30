@@ -44,6 +44,9 @@ export const getAssetGraph = (asset, fy) => {
 
 export const getFinancialYears = () => api.get('/financial-years')
 
+export const getCoinList = () => api.get('/flow/coins')
+export const getCoinFlow = (asset) => api.get(`/flow/coin/${asset}`)
+
 export const importExcel = (files) => {
   const formData = new FormData()
   const fileList = Array.isArray(files) ? files : [files]

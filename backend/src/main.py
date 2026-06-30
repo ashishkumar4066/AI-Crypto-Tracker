@@ -18,6 +18,7 @@ from src.db.database import create_tables
 from src.api.txn_routes import router as txn_router
 from src.api.graph_routes import router as graph_router
 from src.api.import_routes import router as import_router
+from src.api.flow_routes import router as flow_router
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -60,6 +61,7 @@ app.add_middleware(
 app.include_router(txn_router, prefix="/api/v1", tags=["transactions"])
 app.include_router(graph_router, prefix="/api/v1", tags=["graph"])
 app.include_router(import_router, prefix="/api/v1", tags=["import"])
+app.include_router(flow_router, prefix="/api/v1", tags=["flow"])
 
 
 @app.get("/health")

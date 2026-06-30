@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react'
 import Sidebar from './components/Sidebar'
 import FlowGraph from './pages/FlowGraph'
 import Transactions from './pages/Transactions'
+import CoinFlow from './pages/CoinFlow'
 
 function App() {
   const [currentView, setCurrentView] = useState('transactions')
@@ -29,6 +30,9 @@ function App() {
         )}
         {currentView === 'transactions' && (
           <Transactions exchange={selectedExchange} exchangeLabel={exchangeLabel} />
+        )}
+        {currentView === 'coinflow' && (
+          <CoinFlow exchange={selectedExchange} exchangeLabel={exchangeLabel} />
         )}
       </main>
     </div>
